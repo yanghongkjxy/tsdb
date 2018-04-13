@@ -13,7 +13,10 @@
 
 package labels
 
-import "regexp"
+import (
+	"regexp"
+	"strings"
+)
 
 // Selector holds constraints for matching against a label set.
 type Selector []Matcher
@@ -73,6 +76,18 @@ func NewRegexpMatcher(name, pattern string) (Matcher, error) {
 	return &regexpMatcher{name: name, re: re}, nil
 }
 
+// NewRegexpMatcher returns a new matcher verifying that a value matches
+// the regular expression pattern. Will panic if the pattern is not a valid
+// regular expression.
+func NewMustRegexpMatcher(name, pattern string) Matcher {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		panic(err)
+	}
+	return &regexpMatcher{name: name, re: re}
+
+}
+
 // notMatcher inverts the matching result for a matcher.
 type notMatcher struct {
 	Matcher
@@ -84,3 +99,22 @@ func (m *notMatcher) Matches(v string) bool { return !m.Matcher.Matches(v) }
 func Not(m Matcher) Matcher {
 	return &notMatcher{m}
 }
+
+// PrefixMatcher implements Matcher for labels which values matches prefix.
+type PrefixMatcher struct {
+	name, prefix string
+}
+
+// NewPrefixMatcher returns new Matcher for label name matching prefix.
+func NewPrefixMatcher(name, prefix string) Matcher {
+	return &PrefixMatcher{name: name, prefix: prefix}
+}
+
+// Name implements Matcher interface.
+func (m *PrefixMatcher) Name() string { return m.name }
+
+// Prefix returns matching prefix.
+func (m *PrefixMatcher) Prefix() string { return m.prefix }
+
+// Matches implements Matcher interface.
+func (m *PrefixMatcher) Matches(v string) bool { return strings.HasPrefix(v, m.prefix) }

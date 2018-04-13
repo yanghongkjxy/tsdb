@@ -14,83 +14,73 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
-	"net/http"
-	_ "net/http/pprof"
 	"os"
 	"path/filepath"
 	"runtime"
 	"runtime/pprof"
+	"sort"
+	"strings"
 	"sync"
+	"text/tabwriter"
 	"time"
-	"unsafe"
 
-	promlabels "github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/pkg/textparse"
+	"github.com/go-kit/kit/log"
+	"github.com/pkg/errors"
 	"github.com/prometheus/tsdb"
 	"github.com/prometheus/tsdb/labels"
-	"github.com/spf13/cobra"
+	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 func main() {
-	// Start HTTP server for pprof endpoint.
-	go http.ListenAndServe(":9999", nil)
-
-	root := &cobra.Command{
-		Use:   "tsdb",
-		Short: "CLI tool for tsdb",
-	}
-
-	root.AddCommand(
-		NewBenchCommand(),
+	var (
+		cli                  = kingpin.New(filepath.Base(os.Args[0]), "CLI tool for tsdb")
+		benchCmd             = cli.Command("bench", "run benchmarks")
+		benchWriteCmd        = benchCmd.Command("write", "run a write performance benchmark")
+		benchWriteOutPath    = benchWriteCmd.Flag("out", "set the output path").Default("benchout/").String()
+		benchWriteNumMetrics = benchWriteCmd.Flag("metrics", "number of metrics to read").Default("10000").Int()
+		benchSamplesFile     = benchWriteCmd.Arg("file", "input file with samples data, default is (../../testdata/20k.series)").Default("../../testdata/20k.series").String()
+		listCmd              = cli.Command("ls", "list db blocks")
+		listPath             = listCmd.Arg("db path", "database path (default is benchout/storage)").Default("benchout/storage").String()
 	)
 
-	flag.CommandLine.Set("log.level", "debug")
-
-	root.Execute()
-}
-
-func NewBenchCommand() *cobra.Command {
-	c := &cobra.Command{
-		Use:   "bench",
-		Short: "run benchmarks",
+	switch kingpin.MustParse(cli.Parse(os.Args[1:])) {
+	case benchWriteCmd.FullCommand():
+		wb := &writeBenchmark{
+			outPath:     *benchWriteOutPath,
+			numMetrics:  *benchWriteNumMetrics,
+			samplesFile: *benchSamplesFile,
+		}
+		wb.run()
+	case listCmd.FullCommand():
+		db, err := tsdb.Open(*listPath, nil, nil, nil)
+		if err != nil {
+			exitWithError(err)
+		}
+		printBlocks(db.Blocks())
 	}
-	c.AddCommand(NewBenchWriteCommand())
-
-	return c
+	flag.CommandLine.Set("log.level", "debug")
 }
 
 type writeBenchmark struct {
-	outPath    string
-	cleanup    bool
-	numMetrics int
+	outPath     string
+	samplesFile string
+	cleanup     bool
+	numMetrics  int
 
 	storage *tsdb.DB
 
 	cpuprof   *os.File
 	memprof   *os.File
 	blockprof *os.File
+	mtxprof   *os.File
 }
 
-func NewBenchWriteCommand() *cobra.Command {
-	var wb writeBenchmark
-	c := &cobra.Command{
-		Use:   "write <file>",
-		Short: "run a write performance benchmark",
-		Run:   wb.run,
-	}
-	c.PersistentFlags().StringVar(&wb.outPath, "out", "benchout/", "set the output path")
-	c.PersistentFlags().IntVar(&wb.numMetrics, "metrics", 10000, "number of metrics to read")
-	return c
-}
-
-func (b *writeBenchmark) run(cmd *cobra.Command, args []string) {
-	if len(args) != 1 {
-		exitWithError(fmt.Errorf("missing file argument"))
-	}
+func (b *writeBenchmark) run() {
 	if b.outPath == "" {
 		dir, err := ioutil.TempDir("", "tsdb_bench")
 		if err != nil {
@@ -108,12 +98,13 @@ func (b *writeBenchmark) run(cmd *cobra.Command, args []string) {
 
 	dir := filepath.Join(b.outPath, "storage")
 
-	st, err := tsdb.Open(dir, nil, nil, &tsdb.Options{
+	l := log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
+	l = log.With(l, "ts", log.DefaultTimestampUTC, "caller", log.DefaultCaller)
+
+	st, err := tsdb.Open(dir, l, nil, &tsdb.Options{
 		WALFlushInterval:  200 * time.Millisecond,
-		RetentionDuration: 2 * 24 * 60 * 60 * 1000, // 1 days in milliseconds
-		MinBlockDuration:  3 * 60 * 60 * 1000,      // 2 hours in milliseconds
-		MaxBlockDuration:  27 * 60 * 60 * 1000,     // 1 days in milliseconds
-		AppendableBlocks:  2,
+		RetentionDuration: 15 * 24 * 60 * 60 * 1000, // 15 days in milliseconds
+		BlockRanges:       tsdb.ExponentialBlockRanges(2*60*60*1000, 5, 3),
 	})
 	if err != nil {
 		exitWithError(err)
@@ -123,7 +114,7 @@ func (b *writeBenchmark) run(cmd *cobra.Command, args []string) {
 	var metrics []labels.Labels
 
 	measureTime("readData", func() {
-		f, err := os.Open(args[0])
+		f, err := os.Open(b.samplesFile)
 		if err != nil {
 			exitWithError(err)
 		}
@@ -156,6 +147,8 @@ func (b *writeBenchmark) run(cmd *cobra.Command, args []string) {
 	})
 }
 
+const timeDelta = 30000
+
 func (b *writeBenchmark) ingestScrapes(lbls []labels.Labels, scrapeCount int) (uint64, error) {
 	var mu sync.Mutex
 	var total uint64
@@ -173,7 +166,7 @@ func (b *writeBenchmark) ingestScrapes(lbls []labels.Labels, scrapeCount int) (u
 
 			wg.Add(1)
 			go func() {
-				n, err := b.ingestScrapesShard(batch, 100, int64(30000*i))
+				n, err := b.ingestScrapesShard(batch, 100, int64(timeDelta*i))
 				if err != nil {
 					// exitWithError(err)
 					fmt.Println(" err", err)
@@ -186,6 +179,7 @@ func (b *writeBenchmark) ingestScrapes(lbls []labels.Labels, scrapeCount int) (u
 		}
 		wg.Wait()
 	}
+	fmt.Println("ingestion completed")
 
 	return total, nil
 }
@@ -211,7 +205,7 @@ func (b *writeBenchmark) ingestScrapesShard(metrics []labels.Labels, scrapeCount
 
 	for i := 0; i < scrapeCount; i++ {
 		app := b.storage.Appender()
-		ts += int64(30000)
+		ts += timeDelta
 
 		for _, s := range scrape {
 			s.value += 1000
@@ -224,7 +218,7 @@ func (b *writeBenchmark) ingestScrapesShard(metrics []labels.Labels, scrapeCount
 				s.ref = &ref
 			} else if err := app.AddFast(*s.ref, ts, float64(s.value)); err != nil {
 
-				if err.Error() != "not found" {
+				if errors.Cause(err) != tsdb.ErrNotFound {
 					panic(err)
 				}
 
@@ -259,14 +253,20 @@ func (b *writeBenchmark) startProfiling() {
 	if err != nil {
 		exitWithError(fmt.Errorf("bench: could not create memory profile: %v", err))
 	}
-	runtime.MemProfileRate = 4096
+	runtime.MemProfileRate = 64 * 1024
 
 	// Start fatal profiling.
 	b.blockprof, err = os.Create(filepath.Join(b.outPath, "block.prof"))
 	if err != nil {
 		exitWithError(fmt.Errorf("bench: could not create block profile: %v", err))
 	}
-	runtime.SetBlockProfileRate(1)
+	runtime.SetBlockProfileRate(20)
+
+	b.mtxprof, err = os.Create(filepath.Join(b.outPath, "mutex.prof"))
+	if err != nil {
+		exitWithError(fmt.Errorf("bench: could not create mutex profile: %v", err))
+	}
+	runtime.SetMutexProfileFraction(20)
 }
 
 func (b *writeBenchmark) stopProfiling() {
@@ -286,6 +286,12 @@ func (b *writeBenchmark) stopProfiling() {
 		b.blockprof = nil
 		runtime.SetBlockProfileRate(0)
 	}
+	if b.mtxprof != nil {
+		pprof.Lookup("mutex").WriteTo(b.mtxprof, 0)
+		b.mtxprof.Close()
+		b.mtxprof = nil
+		runtime.SetMutexProfileFraction(0)
+	}
 }
 
 func measureTime(stage string, f func()) time.Duration {
@@ -296,21 +302,32 @@ func measureTime(stage string, f func()) time.Duration {
 	return time.Since(start)
 }
 
-func readPrometheusLabels(r io.Reader, n int) ([]labels.Labels, error) {
-	b, err := ioutil.ReadAll(r)
-	if err != nil {
-		return nil, err
+func mapToLabels(m map[string]interface{}, l *labels.Labels) {
+	for k, v := range m {
+		*l = append(*l, labels.Label{Name: k, Value: v.(string)})
 	}
+}
 
-	p := textparse.New(b)
-	i := 0
+func readPrometheusLabels(r io.Reader, n int) ([]labels.Labels, error) {
+	scanner := bufio.NewScanner(r)
+
 	var mets []labels.Labels
 	hashes := map[uint64]struct{}{}
+	i := 0
 
-	for p.Next() && i < n {
+	for scanner.Scan() && i < n {
 		m := make(labels.Labels, 0, 10)
-		p.Metric((*promlabels.Labels)(unsafe.Pointer(&m)))
 
+		r := strings.NewReplacer("\"", "", "{", "", "}", "")
+		s := r.Replace(scanner.Text())
+
+		labelChunks := strings.Split(s, ",")
+		for _, labelChunk := range labelChunks {
+			split := strings.Split(labelChunk, ":")
+			m = append(m, labels.Label{Name: split[0], Value: split[1]})
+		}
+		// Order of the k/v labels matters, don't assume we'll always receive them already sorted.
+		sort.Sort(m)
 		h := m.Hash()
 		if _, ok := hashes[h]; ok {
 			continue
@@ -319,10 +336,30 @@ func readPrometheusLabels(r io.Reader, n int) ([]labels.Labels, error) {
 		hashes[h] = struct{}{}
 		i++
 	}
-	return mets, p.Err()
+	return mets, nil
 }
 
 func exitWithError(err error) {
 	fmt.Fprintln(os.Stderr, err)
 	os.Exit(1)
+}
+
+func printBlocks(blocks []*tsdb.Block) {
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	defer tw.Flush()
+
+	fmt.Fprintln(tw, "BLOCK ULID\tMIN TIME\tMAX TIME\tNUM SAMPLES\tNUM CHUNKS\tNUM SERIES")
+	for _, b := range blocks {
+		meta := b.Meta()
+
+		fmt.Fprintf(tw,
+			"%v\t%v\t%v\t%v\t%v\t%v\n",
+			meta.ULID,
+			meta.MinTime,
+			meta.MaxTime,
+			meta.Stats.NumSamples,
+			meta.Stats.NumChunks,
+			meta.Stats.NumSeries,
+		)
+	}
 }
